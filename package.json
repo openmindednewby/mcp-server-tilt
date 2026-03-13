@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-tilt",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "MCP server for Tilt dev environments — query status, read logs, trigger rebuilds, and wait for resources",
   "type": "module",
   "bin": {

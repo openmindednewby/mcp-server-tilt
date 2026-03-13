@@ -68,12 +68,13 @@ npx mcp-server-tilt
 
 ## Configuration
 
-All configuration is through environment variables:
+### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TILT_PORT` | Auto-detected from `~/.tilt-dev/config`, falls back to `10350` | Tilt API port |
 | `TILT_HOST` | `localhost` | Tilt API host (for remote Tilt instances) |
+| `TILT_MCP_CONFIG` | `.tilt-mcp.json` in working directory | Path to config file |
 
 Example with custom port:
 
@@ -90,6 +91,34 @@ Example with custom port:
   }
 }
 ```
+
+### Project Config File (`.tilt-mcp.json`)
+
+For project-specific customization, create a `.tilt-mcp.json` file in your project root. The server auto-discovers it from the working directory, or you can point to it with `TILT_MCP_CONFIG`.
+
+```json
+{
+  "errorsFile": "./tilt-errors.log",
+  "cwd": "/path/to/project",
+  "groups": {
+    "Backend": ["api-*", "worker-*"],
+    "Frontend": ["web-*", "assets-*"],
+    "Infrastructure": ["postgres", "redis", "rabbitmq"]
+  },
+  "defaultGroup": "Other"
+}
+```
+
+#### Config Options
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `errorsFile` | `string` | Path to an errors log file. When set, the `errors` tool reads from this file instead of querying the Tilt API. Resolved relative to `cwd`. |
+| `cwd` | `string` | Working directory for `tilt` CLI execution. Defaults to the process working directory. |
+| `groups` | `object` | Resource grouping rules for the `resources` tool. Keys are group names, values are arrays of patterns. Patterns support `*` as a suffix wildcard (e.g. `api-*` matches `api-gateway`, `api-auth`). Exact strings match exactly. |
+| `defaultGroup` | `string` | Fallback group name for resources that don't match any pattern. Defaults to `"Other"`. |
+
+Without a config file, the server works with sensible defaults — flat resource lists and API-based error detection.
 
 ## Tool Details
 
@@ -131,11 +160,11 @@ Trigger a resource and poll until it reaches a terminal state (healthy, error, o
 
 ### `errors`
 
-List all resources currently in an error state with their last error message.
+List all resources currently in an error state. When `errorsFile` is configured, reads from the file (useful with external error monitors). Otherwise queries the Tilt API directly.
 
 ### `resources`
 
-List all resource names with a status icon: `[ OK]`, `[ERR]`, `[...]`, or `[ ? ]`.
+List all resource names with a status icon: `[ OK]`, `[ERR]`, `[...]`, or `[ ? ]`. When `groups` are configured, resources are organized by service domain.
 
 ## How It Works
 

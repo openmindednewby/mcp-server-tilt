@@ -11,8 +11,9 @@
  *   npx mcp-server-tilt
  *
  * Configuration (environment variables):
- *   TILT_PORT  — Tilt API port (auto-detected from ~/.tilt-dev/config if omitted)
- *   TILT_HOST  — Tilt API host (default: localhost)
+ *   TILT_PORT       — Tilt API port (auto-detected from ~/.tilt-dev/config if omitted)
+ *   TILT_HOST       — Tilt API host (default: localhost)
+ *   TILT_MCP_CONFIG — Path to .tilt-mcp.json config file (default: auto-discovered in cwd)
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -20,7 +21,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const execAsync = promisify(exec);
@@ -53,10 +54,44 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ---------------------------------------------------------------------------
-// Configuration
+// Project configuration — .tilt-mcp.json
 // ---------------------------------------------------------------------------
 
 const IS_WINDOWS = process.platform === 'win32';
+
+/**
+ * Load project-specific config from .tilt-mcp.json.
+ * Search order:
+ *   1. TILT_MCP_CONFIG env var (explicit path)
+ *   2. .tilt-mcp.json in current working directory
+ */
+function loadConfig() {
+  const paths = [];
+  if (process.env.TILT_MCP_CONFIG) {
+    paths.push(resolve(process.env.TILT_MCP_CONFIG));
+  }
+  paths.push(resolve(process.cwd(), '.tilt-mcp.json'));
+
+  for (const p of paths) {
+    try {
+      if (existsSync(p)) {
+        const cfg = JSON.parse(readFileSync(p, 'utf-8'));
+        stderr(`Loaded config from ${p}`);
+        return cfg;
+      }
+    } catch (err) {
+      stderr(`Failed to load config from ${p}: ${err.message}`);
+    }
+  }
+  stderr('No .tilt-mcp.json found — using defaults');
+  return {};
+}
+
+const CONFIG = loadConfig();
+
+// ---------------------------------------------------------------------------
+// Tilt connection
+// ---------------------------------------------------------------------------
 
 /** Detect the active Tilt port from ~/.tilt-dev/config. Defaults to 10350. */
 function detectTiltPort() {
@@ -66,6 +101,8 @@ function detectTiltPort() {
     const content = readFileSync(configPath, 'utf-8');
     const ctxMatch = content.match(/current-context:\s*"?tilt-(\d+)"?/);
     if (ctxMatch) return ctxMatch[1];
+    // "tilt-default" or empty current-context → use default port
+    if (content.match(/current-context:\s*"?tilt-default"?/)) return '10350';
   } catch {
     /* config not found or unreadable — use default */
   }
@@ -151,6 +188,7 @@ async function tiltCli(args, timeoutMs = 30_000, retries = 2) {
         encoding: 'utf-8',
         maxBuffer: 10 * 1024 * 1024,
         ...(IS_WINDOWS && { windowsHide: true }),
+        ...(CONFIG.cwd && { cwd: CONFIG.cwd }),
       });
       return stdout.trim();
     } catch (err) {
@@ -191,13 +229,30 @@ function statusIcon(runtime, update) {
 }
 
 // ---------------------------------------------------------------------------
+// Resource grouping (config-driven)
+// ---------------------------------------------------------------------------
+
+function matchesPattern(name, pattern) {
+  if (pattern.endsWith('*')) return name.startsWith(pattern.slice(0, -1));
+  return name === pattern;
+}
+
+function getGroup(name) {
+  if (!CONFIG.groups) return null;
+  for (const [group, patterns] of Object.entries(CONFIG.groups)) {
+    if (patterns.some((p) => matchesPattern(name, p))) return group;
+  }
+  return CONFIG.defaultGroup || 'Other';
+}
+
+// ---------------------------------------------------------------------------
 // Server factory — exported for Smithery scanning
 // ---------------------------------------------------------------------------
 
 export function createServer() {
   const server = new McpServer({
     name: 'mcp-server-tilt',
-    version: '1.0.0',
+    version: '1.1.0',
   });
 
   // ---- status -------------------------------------------------------------
@@ -250,7 +305,7 @@ export function createServer() {
     },
     async ({ name, lines }) => {
       const n = lines ?? 50;
-      const output = await tiltCli(`logs ${name} --tail ${n}`, 15_000);
+      const output = await tiltCli(`logs --resource ${name}`, 15_000);
       const trimmed = lastLines(output, n);
       return { content: [{ type: 'text', text: trimmed || '(no logs)' }] };
     },
@@ -299,7 +354,7 @@ export function createServer() {
           const errMsg = s.buildHistory?.[0]?.error || '';
           let text = `FAILED: ${name}\nUpdate: ${s.updateStatus} | Runtime: ${lastRuntime}`;
           if (errMsg) text += `\nError: ${errMsg.substring(0, 500)}`;
-          try { text += `\n\nRecent logs:\n${lastLines(await tiltCli(`logs ${name} --tail 40`, 10_000), 40)}`; } catch { /* ignore */ }
+          try { text += `\n\nRecent logs:\n${lastLines(await tiltCli(`logs --resource ${name}`, 10_000), 40)}`; } catch { /* ignore */ }
           return { content: [{ type: 'text', text }] };
         }
         if (s.updateStatus === 'ok' || s.updateStatus === 'not_applicable') {
@@ -308,7 +363,7 @@ export function createServer() {
           }
           if (s.runtimeStatus === 'error' || s.runtimeStatus === 'not_ok') {
             let text = `PARTIAL: ${name} — update succeeded but runtime error\nRuntime: ${s.runtimeStatus}`;
-            try { text += `\n\nRecent logs:\n${lastLines(await tiltCli(`logs ${name} --tail 40`, 10_000), 40)}`; } catch { /* ignore */ }
+            try { text += `\n\nRecent logs:\n${lastLines(await tiltCli(`logs --resource ${name}`, 10_000), 40)}`; } catch { /* ignore */ }
             return { content: [{ type: 'text', text }] };
           }
         }
@@ -321,9 +376,25 @@ export function createServer() {
   // ---- errors -------------------------------------------------------------
   server.tool(
     'errors',
-    'List all Tilt resources currently in an error state with their last error message.',
+    'List Tilt resources in an error state. Reads from a configured errors file if available, otherwise queries the Tilt API.',
     {},
     async () => {
+      // File-based errors (from external error monitor)
+      if (CONFIG.errorsFile) {
+        const filePath = resolve(CONFIG.cwd || process.cwd(), CONFIG.errorsFile);
+        if (!existsSync(filePath)) {
+          return {
+            content: [{
+              type: 'text',
+              text: `No errors — ${CONFIG.errorsFile} does not exist (all resources healthy, or monitor not running).`,
+            }],
+          };
+        }
+        const content = readFileSync(filePath, 'utf-8');
+        return { content: [{ type: 'text', text: content || 'No errors — file is empty.' }] };
+      }
+
+      // API-based errors (default)
       const data = await tiltApiFetch('/uiresources');
       const items = (data.items || []).map((item) => {
         const name = item.metadata?.name || 'unknown';
@@ -347,11 +418,32 @@ export function createServer() {
   // ---- resources ----------------------------------------------------------
   server.tool(
     'resources',
-    'List all Tilt resource names with their current status.',
+    'List all Tilt resource names with status icons. Groups by service domain when configured.',
     {},
     async () => {
       const data = await tiltApiFetch('/uiresources');
       const items = (data.items || []).map(formatResourceLine);
+
+      // Grouped output when config.groups is defined
+      if (CONFIG.groups) {
+        const groups = {};
+        for (const item of items) {
+          const group = getGroup(item.name);
+          if (!groups[group]) groups[group] = [];
+          groups[group].push(item);
+        }
+        let text = '';
+        for (const [group, members] of Object.entries(groups).sort()) {
+          text += `## ${group}\n`;
+          for (const i of members) {
+            text += `  [${statusIcon(i.runtime, i.update)}] ${i.name}\n`;
+          }
+          text += '\n';
+        }
+        return { content: [{ type: 'text', text }] };
+      }
+
+      // Flat list (default)
       let text = '';
       for (const i of items) text += `[${statusIcon(i.runtime, i.update)}] ${i.name}\n`;
       return { content: [{ type: 'text', text }] };
