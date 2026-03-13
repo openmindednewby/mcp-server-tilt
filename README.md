@@ -186,6 +186,7 @@ Issues and pull requests are welcome on [GitHub](https://github.com/openmindedne
 - [GitHub repository](https://github.com/openmindednewby/mcp-server-tilt)
 - [Model Context Protocol](https://modelcontextprotocol.io)
 - [Tilt](https://tilt.dev)
+- [Tilt integration request](https://github.com/tilt-dev/tilt/issues/6724) — tracking issue for official docs mention
 
 ## License
 
