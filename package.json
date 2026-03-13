@@ -1,0 +1,38 @@
+{
+  "name": "mcp-server-tilt",
+  "version": "1.0.0",
+  "description": "MCP server for Tilt dev environments — query status, read logs, trigger rebuilds, and wait for resources",
+  "type": "module",
+  "bin": {
+    "mcp-server-tilt": "./index.mjs"
+  },
+  "main": "index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "mcp",
+    "tilt",
+    "devtools",
+    "model-context-protocol",
+    "claude",
+    "ai",
+    "dev-environment",
+    "kubernetes"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.0"
+  }
+}

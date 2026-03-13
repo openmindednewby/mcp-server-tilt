@@ -1,0 +1,489 @@
+#!/usr/bin/env node
+
+/**
+ * mcp-server-tilt
+ *
+ * MCP server for Tilt dev environments. Exposes tools to query resource
+ * status, read logs, trigger rebuilds, and wait for services to become
+ * healthy — all through the Model Context Protocol.
+ *
+ * Usage:
+ *   npx mcp-server-tilt
+ *
+ * Configuration (environment variables):
+ *   TILT_PORT  — Tilt API port (auto-detected from ~/.tilt-dev/config if omitted)
+ *   TILT_HOST  — Tilt API host (default: localhost)
+ */
+
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+const execAsync = promisify(exec);
+
+// ---------------------------------------------------------------------------
+// Stdout protection — StdioServerTransport uses stdout for JSON-RPC.
+// Any stray write to stdout corrupts the protocol. Redirect all console
+// methods to stderr and install global error handlers.
+// ---------------------------------------------------------------------------
+const stderr = (...args) => {
+  process.stderr.write(`[mcp-server-tilt] ${args.join(' ')}\n`);
+};
+console.log = console.info = console.debug = stderr;
+console.warn = (...args) => {
+  process.stderr.write(`[mcp-server-tilt] WARN: ${args.join(' ')}\n`);
+};
+console.error = (...args) => {
+  process.stderr.write(`[mcp-server-tilt] ERROR: ${args.join(' ')}\n`);
+};
+
+process.on('uncaughtException', (err) => {
+  process.stderr.write(
+    `[mcp-server-tilt] uncaughtException: ${err?.message}\n`,
+  );
+});
+process.on('unhandledRejection', (reason) => {
+  process.stderr.write(
+    `[mcp-server-tilt] unhandledRejection: ${reason}\n`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+const IS_WINDOWS = process.platform === 'win32';
+
+/** Detect the active Tilt port from ~/.tilt-dev/config. Defaults to 10350. */
+function detectTiltPort() {
+  try {
+    const home = process.env.USERPROFILE || process.env.HOME || '';
+    const configPath = resolve(home, '.tilt-dev', 'config');
+    const content = readFileSync(configPath, 'utf-8');
+    // current-context: tilt-NNNNN → port is NNNNN
+    const ctxMatch = content.match(/current-context:\s*"?tilt-(\d+)"?/);
+    if (ctxMatch) return ctxMatch[1];
+  } catch {
+    /* config not found or unreadable — use default */
+  }
+  return '10350';
+}
+
+const TILT_PORT = process.env.TILT_PORT || detectTiltPort();
+const TILT_HOST = process.env.TILT_HOST || 'localhost';
+
+// ---------------------------------------------------------------------------
+// Concurrency control — limits parallel tilt CLI calls to prevent overload
+// ---------------------------------------------------------------------------
+
+class Semaphore {
+  constructor(max) {
+    this.max = max;
+    this.current = 0;
+    this.queue = [];
+  }
+
+  async acquire() {
+    if (this.current < this.max) {
+      this.current++;
+      return;
+    }
+    await new Promise((r) => this.queue.push(r));
+  }
+
+  release() {
+    this.current--;
+    if (this.queue.length > 0) {
+      this.current++;
+      this.queue.shift()();
+    }
+  }
+}
+
+const cliSemaphore = new Semaphore(3);
+
+// ---------------------------------------------------------------------------
+// Shared resource cache — deduplicates parallel polls
+// ---------------------------------------------------------------------------
+
+const CACHE_TTL_MS = 2000;
+let resourceCache = { data: null, timestamp: 0 };
+let resourceCacheFetchPromise = null;
+
+/**
+ * Fetch all resources with deduplication. When multiple parallel polls
+ * hit this within the same 2s window, only one CLI call is made.
+ */
+async function getCachedAllResources() {
+  const now = Date.now();
+  if (resourceCache.data && now - resourceCache.timestamp < CACHE_TTL_MS) {
+    return resourceCache.data;
+  }
+  if (resourceCacheFetchPromise) {
+    return resourceCacheFetchPromise;
+  }
+  resourceCacheFetchPromise = tiltApiFetch('/uiresources')
+    .then((data) => {
+      resourceCache = { data, timestamp: Date.now() };
+      resourceCacheFetchPromise = null;
+      return data;
+    })
+    .catch((err) => {
+      resourceCacheFetchPromise = null;
+      throw err;
+    });
+  return resourceCacheFetchPromise;
+}
+
+async function getCachedResource(name) {
+  const all = await getCachedAllResources();
+  const item = (all.items || []).find((i) => i.metadata?.name === name);
+  if (!item) throw new Error(`Resource "${name}" not found in Tilt`);
+  return item;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function isRetryable(err) {
+  const msg = err?.message || '';
+  return (
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('EPIPE')
+  );
+}
+
+/**
+ * Execute a tilt CLI command. Includes concurrency semaphore and retry
+ * with backoff for transient network errors.
+ */
+async function tiltCli(args, timeoutMs = 30_000, retries = 2) {
+  const hostFlag = TILT_HOST !== 'localhost' ? ` --host ${TILT_HOST}` : '';
+  const cmd = `tilt --port ${TILT_PORT}${hostFlag} ${args}`;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    await cliSemaphore.acquire();
+    try {
+      const { stdout } = await execAsync(cmd, {
+        timeout: timeoutMs,
+        encoding: 'utf-8',
+        maxBuffer: 10 * 1024 * 1024,
+        ...(IS_WINDOWS && { windowsHide: true }),
+      });
+      return stdout.trim();
+    } catch (err) {
+      if (attempt < retries && isRetryable(err)) {
+        await sleep(1000 * (attempt + 1));
+        continue;
+      }
+      throw err;
+    } finally {
+      cliSemaphore.release();
+    }
+  }
+}
+
+/**
+ * Fetch Tilt resource data via CLI (`tilt get`).
+ * Tilt v0.36+ serves the SPA UI on all HTTP paths, making the REST API
+ * unreachable via fetch. The CLI uses an internal gRPC channel that works.
+ */
+async function tiltApiFetch(path) {
+  const parts = path.replace(/^\//, '').split('/');
+  const kind = parts[0];
+  const name = parts[1];
+  const cmd = name ? `get ${kind} ${name} -o json` : `get ${kind} -o json`;
+  const json = await tiltCli(cmd, 30_000);
+  return JSON.parse(json);
+}
+
+function lastLines(text, n) {
+  return text.split('\n').slice(-n).join('\n');
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function formatResourceLine(item) {
+  const name = item.metadata?.name || 'unknown';
+  const s = item.status || {};
+  const runtime = s.runtimeStatus || 'n/a';
+  const update = s.updateStatus || 'n/a';
+  return { name, runtime, update };
+}
+
+function statusIcon(runtime, update) {
+  if (runtime === 'error' || update === 'error') return 'ERR';
+  if (runtime === 'pending' || update === 'in_progress') return '...';
+  if (runtime === 'ok' || update === 'ok' || update === 'not_applicable')
+    return ' OK';
+  return ' ? ';
+}
+
+// ---------------------------------------------------------------------------
+// MCP Server
+// ---------------------------------------------------------------------------
+
+const server = new McpServer({
+  name: 'mcp-server-tilt',
+  version: '1.0.0',
+});
+
+// ---- status ---------------------------------------------------------------
+server.tool(
+  'status',
+  'Get status of Tilt resources. Returns runtime/update status for all or a specific resource.',
+  {
+    name: z
+      .string()
+      .optional()
+      .describe('Resource name (optional — omit for all resources)'),
+  },
+  async ({ name }) => {
+    if (name) {
+      const data = await tiltApiFetch(`/uiresources/${name}`);
+      const s = data.status || {};
+      const runtime = s.runtimeStatus || 'n/a';
+      const update = s.updateStatus || 'n/a';
+      const lastErr = s.buildHistory?.[0]?.error || '';
+      let text = `Resource: ${name}\nRuntime:  ${runtime}\nUpdate:   ${update}`;
+      if (lastErr) text += `\nLast Error: ${lastErr.substring(0, 500)}`;
+      return { content: [{ type: 'text', text }] };
+    }
+
+    const data = await tiltApiFetch('/uiresources');
+    const items = (data.items || []).map(formatResourceLine);
+
+    const errors = items.filter(
+      (i) => i.runtime === 'error' || i.update === 'error',
+    );
+    const pending = items.filter(
+      (i) =>
+        (i.runtime === 'pending' || i.update === 'in_progress') &&
+        !errors.includes(i),
+    );
+    const healthy = items.filter(
+      (i) => !errors.includes(i) && !pending.includes(i),
+    );
+
+    let text = `# Tilt Status — ${items.length} resources\n`;
+    if (errors.length) {
+      text += `\n## ERRORS (${errors.length})\n`;
+      for (const i of errors)
+        text += `  [ERR] ${i.name}  runtime=${i.runtime}  update=${i.update}\n`;
+    }
+    if (pending.length) {
+      text += `\n## IN PROGRESS (${pending.length})\n`;
+      for (const i of pending)
+        text += `  [...] ${i.name}  runtime=${i.runtime}  update=${i.update}\n`;
+    }
+    text += `\n## HEALTHY (${healthy.length})\n`;
+    for (const i of healthy)
+      text += `  [ OK] ${i.name}  runtime=${i.runtime}  update=${i.update}\n`;
+
+    return { content: [{ type: 'text', text }] };
+  },
+);
+
+// ---- logs -----------------------------------------------------------------
+server.tool(
+  'logs',
+  'Get recent logs for a Tilt resource.',
+  {
+    name: z
+      .string()
+      .describe('Resource name (e.g. my-api, frontend-build)'),
+    lines: z
+      .number()
+      .optional()
+      .describe('Number of lines to return (default 50)'),
+  },
+  async ({ name, lines }) => {
+    const n = lines ?? 50;
+    const output = await tiltCli(`logs ${name} --tail ${n}`, 15_000);
+    const trimmed = lastLines(output, n);
+    return { content: [{ type: 'text', text: trimmed || '(no logs)' }] };
+  },
+);
+
+// ---- trigger --------------------------------------------------------------
+server.tool(
+  'trigger',
+  'Trigger a manual Tilt resource (rebuild, rerun tests, restart service). Returns immediately — does NOT wait for completion. Use trigger_and_wait if you need to wait.',
+  {
+    name: z
+      .string()
+      .describe('Resource name to trigger (e.g. my-api, frontend-build)'),
+  },
+  async ({ name }) => {
+    await tiltCli(`trigger ${name}`, 10_000);
+    return {
+      content: [{ type: 'text', text: `Triggered: ${name}` }],
+    };
+  },
+);
+
+// ---- trigger_and_wait -----------------------------------------------------
+server.tool(
+  'trigger_and_wait',
+  'Trigger a resource and poll until it completes (healthy or error). Returns final status and logs on failure.',
+  {
+    name: z.string().describe('Resource name to trigger'),
+    timeout_seconds: z
+      .number()
+      .optional()
+      .describe('Max seconds to wait (default 180, max 600)'),
+  },
+  async ({ name, timeout_seconds }) => {
+    const timeout = Math.min(timeout_seconds ?? 180, 600);
+
+    await tiltCli(`trigger ${name}`, 10_000);
+    await sleep(2000);
+
+    const deadline = Date.now() + timeout * 1000;
+    let lastRuntime = 'unknown';
+    let lastUpdate = 'unknown';
+
+    while (Date.now() < deadline) {
+      let s;
+      try {
+        const item = await getCachedResource(name);
+        s = item.status || {};
+      } catch {
+        await sleep(3000 + Math.random() * 2000);
+        continue;
+      }
+
+      lastRuntime = s.runtimeStatus || 'n/a';
+      lastUpdate = s.updateStatus || 'n/a';
+
+      // Update failed
+      if (s.updateStatus === 'error') {
+        const errMsg = s.buildHistory?.[0]?.error || '';
+        let text = `FAILED: ${name}\nUpdate: ${s.updateStatus} | Runtime: ${lastRuntime}`;
+        if (errMsg) text += `\nError: ${errMsg.substring(0, 500)}`;
+        try {
+          text += `\n\nRecent logs:\n${lastLines(await tiltCli(`logs ${name} --tail 40`, 10_000), 40)}`;
+        } catch {
+          /* ignore */
+        }
+        return { content: [{ type: 'text', text }] };
+      }
+
+      // Update succeeded
+      if (
+        s.updateStatus === 'ok' ||
+        s.updateStatus === 'not_applicable'
+      ) {
+        if (
+          !s.runtimeStatus ||
+          s.runtimeStatus === 'ok' ||
+          s.runtimeStatus === 'not_applicable'
+        ) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `OK: ${name} (runtime=${lastRuntime}, update=${s.updateStatus})`,
+              },
+            ],
+          };
+        }
+        if (
+          s.runtimeStatus === 'error' ||
+          s.runtimeStatus === 'not_ok'
+        ) {
+          let text = `PARTIAL: ${name} — update succeeded but runtime error\nRuntime: ${s.runtimeStatus}`;
+          try {
+            text += `\n\nRecent logs:\n${lastLines(await tiltCli(`logs ${name} --tail 40`, 10_000), 40)}`;
+          } catch {
+            /* ignore */
+          }
+          return { content: [{ type: 'text', text }] };
+        }
+      }
+
+      await sleep(3000 + Math.random() * 2000);
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `TIMEOUT: ${name} after ${timeout}s\nLast status: runtime=${lastRuntime}, update=${lastUpdate}`,
+        },
+      ],
+    };
+  },
+);
+
+// ---- errors ---------------------------------------------------------------
+server.tool(
+  'errors',
+  'List all Tilt resources currently in an error state with their last error message.',
+  {},
+  async () => {
+    const data = await tiltApiFetch('/uiresources');
+    const items = (data.items || []).map((item) => {
+      const name = item.metadata?.name || 'unknown';
+      const s = item.status || {};
+      const runtime = s.runtimeStatus || 'n/a';
+      const update = s.updateStatus || 'n/a';
+      const lastErr = s.buildHistory?.[0]?.error || '';
+      return { name, runtime, update, lastErr };
+    });
+
+    const errors = items.filter(
+      (i) => i.runtime === 'error' || i.update === 'error',
+    );
+
+    if (errors.length === 0) {
+      return {
+        content: [
+          { type: 'text', text: 'No errors — all resources healthy.' },
+        ],
+      };
+    }
+
+    let text = `## ${errors.length} resource(s) in error state\n\n`;
+    for (const e of errors) {
+      text += `**${e.name}** — runtime=${e.runtime}, update=${e.update}\n`;
+      if (e.lastErr) text += `  Error: ${e.lastErr.substring(0, 300)}\n`;
+      text += '\n';
+    }
+
+    return { content: [{ type: 'text', text }] };
+  },
+);
+
+// ---- resources ------------------------------------------------------------
+server.tool(
+  'resources',
+  'List all Tilt resource names with their current status.',
+  {},
+  async () => {
+    const data = await tiltApiFetch('/uiresources');
+    const items = (data.items || []).map(formatResourceLine);
+
+    let text = '';
+    for (const i of items) {
+      text += `[${statusIcon(i.runtime, i.update)}] ${i.name}\n`;
+    }
+
+    return { content: [{ type: 'text', text }] };
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
