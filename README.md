@@ -1,5 +1,9 @@
 # mcp-server-tilt
 
+[![npm version](https://img.shields.io/npm/v/mcp-server-tilt.svg)](https://www.npmjs.com/package/mcp-server-tilt)
+[![license](https://img.shields.io/npm/l/mcp-server-tilt.svg)](https://github.com/openmindednewby/mcp-server-tilt/blob/main/LICENSE)
+[![node](https://img.shields.io/node/v/mcp-server-tilt.svg)](https://nodejs.org)
+
 MCP server for [Tilt](https://tilt.dev) dev environments. Query resource status, read logs, trigger rebuilds, and wait for services to become healthy — all through the [Model Context Protocol](https://modelcontextprotocol.io).
 
 ## Tools
@@ -14,6 +18,10 @@ MCP server for [Tilt](https://tilt.dev) dev environments. Query resource status,
 | `resources` | List all resource names with status icons |
 
 ## Installation
+
+```bash
+npx mcp-server-tilt
+```
 
 ### Claude Code
 
@@ -45,15 +53,13 @@ Add to your Claude Desktop config (`claude_desktop_config.json`):
 }
 ```
 
-### Other MCP clients
+### Other MCP Clients
 
-Run the server directly:
+The server communicates over stdio using the MCP protocol. Point any MCP-compatible client at:
 
 ```bash
 npx mcp-server-tilt
 ```
-
-The server communicates over stdio using the MCP protocol.
 
 ## Prerequisites
 
@@ -141,6 +147,17 @@ Key implementation details:
 - **Retry with backoff** — Transient network errors (ETIMEDOUT, ECONNRESET) are retried up to 2 times
 - **Jittered polling** — `trigger_and_wait` uses randomized poll intervals to prevent thundering herd
 
+## Contributing
+
+Issues and pull requests are welcome on [GitHub](https://github.com/openmindednewby/mcp-server-tilt).
+
+## Links
+
+- [npm package](https://www.npmjs.com/package/mcp-server-tilt)
+- [GitHub repository](https://github.com/openmindednewby/mcp-server-tilt)
+- [Model Context Protocol](https://modelcontextprotocol.io)
+- [Tilt](https://tilt.dev)
+
 ## License
 
-MIT
+[MIT](LICENSE)
