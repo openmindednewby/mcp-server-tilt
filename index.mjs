@@ -252,7 +252,7 @@ function getGroup(name) {
 export function createServer() {
   const server = new McpServer({
     name: 'mcp-server-tilt',
-    version: '1.1.0',
+    version: '1.1.1',
   });
 
   // ---- status -------------------------------------------------------------
@@ -305,7 +305,7 @@ export function createServer() {
     },
     async ({ name, lines }) => {
       const n = lines ?? 50;
-      const output = await tiltCli(`logs --resource ${name}`, 15_000);
+      const output = await tiltCli(`logs ${name} --tail ${n}`, 15_000);
       const trimmed = lastLines(output, n);
       return { content: [{ type: 'text', text: trimmed || '(no logs)' }] };
     },
@@ -354,7 +354,7 @@ export function createServer() {
           const errMsg = s.buildHistory?.[0]?.error || '';
           let text = `FAILED: ${name}\nUpdate: ${s.updateStatus} | Runtime: ${lastRuntime}`;
           if (errMsg) text += `\nError: ${errMsg.substring(0, 500)}`;
-          try { text += `\n\nRecent logs:\n${lastLines(await tiltCli(`logs --resource ${name}`, 10_000), 40)}`; } catch { /* ignore */ }
+          try { text += `\n\nRecent logs:\n${lastLines(await tiltCli(`logs ${name} --tail 40`, 10_000), 40)}`; } catch { /* ignore */ }
           return { content: [{ type: 'text', text }] };
         }
         if (s.updateStatus === 'ok' || s.updateStatus === 'not_applicable') {
@@ -363,7 +363,7 @@ export function createServer() {
           }
           if (s.runtimeStatus === 'error' || s.runtimeStatus === 'not_ok') {
             let text = `PARTIAL: ${name} — update succeeded but runtime error\nRuntime: ${s.runtimeStatus}`;
-            try { text += `\n\nRecent logs:\n${lastLines(await tiltCli(`logs --resource ${name}`, 10_000), 40)}`; } catch { /* ignore */ }
+            try { text += `\n\nRecent logs:\n${lastLines(await tiltCli(`logs ${name} --tail 40`, 10_000), 40)}`; } catch { /* ignore */ }
             return { content: [{ type: 'text', text }] };
           }
         }
