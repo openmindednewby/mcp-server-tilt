@@ -22,11 +22,11 @@
     "dev-environment",
     "kubernetes"
   ],
-  "author": "",
+  "author": "dloizides",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "https://github.com/openmindednewby/mcp-server-tilt.git"
   },
   "engines": {
     "node": ">=18.0.0"
